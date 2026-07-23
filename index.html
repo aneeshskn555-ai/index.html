@@ -1639,6 +1639,38 @@ const SUPABASE_URL = "https://gdechsbvozalpkobmbay.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdkZWNoc2J2b3phbHBrb2JtYmF5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1MzQ3NTAsImV4cCI6MjEwMDExMDc1MH0.8hdARI1UW5278XZWcG6OcORCz8HHSJ13MoCCpOH1wgI";
 const SB_HEADERS = { "apikey": SUPABASE_KEY, "Authorization": `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" };
 
+async function sbFetchOne(table, id){
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?id=eq.${id}&select=*`, { headers: SB_HEADERS });
+  if(!res.ok) throw new Error(`Supabase fetch one from "${table}" (id ${id}) failed (HTTP ${res.status}): ${await res.text()}`);
+  const rows = await res.json();
+  return rows[0] || null;
+}
+// Checks whether Supabase has a newer version of this exact record than the local
+// copy (e.g. it was edited on a different browser/device since this browser last saw
+// it), and if so, pulls that newer version in locally. Returns true if a refresh
+// happened. This is the core of "last edit wins, but you're always shown the latest
+// version before you start editing" — simpler than full multi-user merge conflict
+// resolution, and the right fit for a single person using this across devices.
+async function refreshRecordIfCloudIsNewer(table, id){
+  try {
+    const cloudRow = await sbFetchOne(table, id);
+    if(!cloudRow) return false;
+    const localRow = q1(`SELECT updated_at FROM ${table} WHERE id = ?`, [id]);
+    if(!localRow) return false;
+    const cloudTime = cloudRow.updated_at ? new Date(cloudRow.updated_at).getTime() : 0;
+    const localTime = localRow.updated_at ? new Date(localRow.updated_at).getTime() : 0;
+    if(cloudTime <= localTime) return false;
+    const allCols = q(`PRAGMA table_info(${table})`).map(r=>r.name);
+    const setClause = allCols.filter(c=>c!=="id").map(c=>`${c} = ?`).join(", ");
+    const vals = allCols.filter(c=>c!=="id").map(c => (cloudRow[c] === undefined ? null : cloudRow[c]));
+    db.run(`UPDATE ${table} SET ${setClause} WHERE id = ?`, [...vals, id]);
+    return true;
+  } catch(err){
+    console.error(`Freshness check failed for "${table}" id ${id}, editing local copy as-is:`, err);
+    return false;
+  }
+}
+
 async function sbInsert(table, row){
   const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}`, {
     method: "POST", headers: {...SB_HEADERS, "Prefer": "return=representation"}, body: JSON.stringify(row)
@@ -1762,6 +1794,92 @@ async function recoverTableFromCloudIfAvailable(table){
     return false;
   }
 }
+// Recovery above only fires when a browser's local data is completely empty — it never
+// helps an already-used browser notice NEW records created elsewhere (e.g. on a
+// different browser or device). This fills that gap: on every boot, pull down any
+// cloud rows this browser doesn't have yet (matched by id) and add them locally,
+// without touching or replacing anything already here — purely additive, so it can
+// never overwrite local edits that haven't synced up yet. It doesn't catch UPDATES
+// made to a record elsewhere, only records that are entirely new to this browser.
+// Handles two cases for any table with an "id" and "updated_at" column:
+// (1) a row exists in Supabase but not locally yet — inserted, same as before.
+// (2) a row exists in BOTH, but they've diverged (edited on two different
+//     browsers/devices) — whichever side has the newer updated_at wins, and the
+//     older side gets overwritten to match.
+// What this deliberately does NOT handle: a row deleted on one side but still
+// present on the other. There's no "this was intentionally deleted" marker to
+// tell that apart from "this was created locally while offline and never synced
+// up yet" — treating a cloud-missing row as a delete would risk destroying real
+// local work, so a locally-existing row is never removed by this process. Deletes
+// still sync normally when performed through the app's own delete buttons.
+async function reconcileTableWithCloud(table, idField){
+  idField = idField || "id";
+  try {
+    const remoteRows = await sbFetchAll(table);
+    if(!remoteRows.length) return;
+    const allCols = q(`PRAGMA table_info(${table})`).map(r=>r.name);
+    if(!allCols.includes("updated_at")){
+      // No timestamp to compare by — fall back to the simpler "add if missing" behavior.
+      const localIds = new Set(q(`SELECT ${idField} as k FROM ${table}`).map(r=>r.k));
+      const missing = remoteRows.filter(r => !localIds.has(r[idField]));
+      if(!missing.length) return;
+      const placeholders = allCols.map(()=>"?").join(",");
+      const stmt = db.prepare(`INSERT INTO ${table} (${allCols.join(",")}) VALUES (${placeholders})`);
+      missing.forEach(r=>{ stmt.run(allCols.map(c => (r[c] === undefined ? null : r[c]))); });
+      stmt.free();
+      return;
+    }
+    const localRows = q(`SELECT * FROM ${table}`);
+    const localById = new Map(localRows.map(r=>[r[idField], r]));
+    const placeholders = allCols.map(()=>"?").join(",");
+    const insStmt = db.prepare(`INSERT INTO ${table} (${allCols.join(",")}) VALUES (${placeholders})`);
+    const updateCols = allCols.filter(c => c !== idField);
+    const setClause = updateCols.map(c=>`${c} = ?`).join(", ");
+    for(const remoteRow of remoteRows){
+      const localRow = localById.get(remoteRow[idField]);
+      if(!localRow){
+        insStmt.run(allCols.map(c => (remoteRow[c] === undefined ? null : remoteRow[c])));
+        continue;
+      }
+      const remoteTime = remoteRow.updated_at ? new Date(remoteRow.updated_at).getTime() : 0;
+      const localTime = localRow.updated_at ? new Date(localRow.updated_at).getTime() : 0;
+      if(remoteTime > localTime){
+        const vals = updateCols.map(c => (remoteRow[c] === undefined ? null : remoteRow[c]));
+        db.run(`UPDATE ${table} SET ${setClause} WHERE ${idField} = ?`, [...vals, remoteRow[idField]]);
+      } else if(localTime > remoteTime){
+        const updateObj = {};
+        updateCols.forEach(c=>{ updateObj[c] = localRow[c]; });
+        sbUpdate(table, localRow[idField], updateObj).catch(()=>{});
+      }
+    }
+    insStmt.free();
+  } catch(err){
+    console.error(`Reconcile failed for "${table}":`, err);
+  }
+}
+async function mergeAllTablesFromCloud(){
+  await reconcileTableWithCloud("cds");
+  for(const table of CLOUD_RECOVERABLE_TABLES){
+    if(table === "master_values") continue; // has its own composite-uniqueness handling below
+    await reconcileTableWithCloud(table);
+  }
+  try {
+    const remoteVals = await sbFetchAll("master_values");
+    const localKeys = new Set(q("SELECT category, value FROM master_values").map(r=>`${r.category}::${(r.value||"").toLowerCase()}`));
+    const missing = remoteVals.filter(r => !localKeys.has(`${r.category}::${(r.value||"").toLowerCase()}`));
+    if(missing.length){
+      const stmt = db.prepare("INSERT OR IGNORE INTO master_values (id, category, value) VALUES (?,?,?)");
+      missing.forEach(r=> stmt.run([r.id, r.category, r.value]));
+      stmt.free();
+    }
+  } catch(err){ console.error("Merge sync failed for master_values:", err); }
+  try {
+    const remoteSettings = await sbFetchAll("app_settings");
+    const stmt = db.prepare("INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING");
+    remoteSettings.forEach(r=> stmt.run([r.key, r.value]));
+    stmt.free();
+  } catch(err){ console.error("Merge sync failed for app_settings:", err); }
+}
 // Every table that should try to restore from Supabase on a genuinely fresh/cleared
 // browser before falling back to local defaults. CDs has its own dedicated function
 // above; app_settings has its own recovery function below (keyed by "key" text, not
@@ -1824,6 +1942,7 @@ async function initDb(){
     runSoldDateBackfill();
     runPaymentBackfill();
     runInventoryTxnRetag();
+    await mergeAllTablesFromCloud();
   } else {
     db = new SQL.Database();
     db.run(SCHEMA);
@@ -2853,6 +2972,12 @@ function openEdit(id){
   document.getElementById("statusOverrideWrap").style.display = "flex";
   updateComputedStrip();
   switchView("form");
+  refreshRecordIfCloudIsNewer("cds", id).then(refreshed=>{
+    if(refreshed && Number(document.getElementById("f_id").value) === id){
+      openEdit(id);
+      document.getElementById("formMsg").textContent = "This CD was edited elsewhere since you last saw it — refreshed with the latest version.";
+    }
+  });
 }
 
 function readForm(){
@@ -4351,6 +4476,15 @@ function openSimpleForm(key, id){
     sgEl.addEventListener("change", filterGroupOptions);
   }
   panel.scrollIntoView({behavior:"smooth", block:"nearest"});
+  if(id){
+    refreshRecordIfCloudIsNewer(mod.table, id).then(refreshed=>{
+      if(refreshed && getSimpleState(key).editingId === id){
+        openSimpleForm(key, id); // re-populate with the now-current data
+        const freshMsgEl = document.getElementById(`formMsg_${key}`);
+        if(freshMsgEl) freshMsgEl.textContent = "This record was edited elsewhere since you last saw it — refreshed with the latest version.";
+      }
+    });
+  }
 }
 function closeSimpleForm(key){
   document.getElementById("formPanel_"+key).style.display = "none";
@@ -4890,6 +5024,14 @@ function openVlForm(id){
     const el = document.getElementById("vl_"+k);
     el.value = row && row[k] !== null && row[k] !== undefined ? row[k] : "";
   });
+  if(id){
+    refreshRecordIfCloudIsNewer("vendor_ledger", id).then(refreshed=>{
+      if(refreshed && vlEditingId === id){
+        openVlForm(id);
+        showSyncToast("This record was edited elsewhere since you last saw it — refreshed with the latest version.", false);
+      }
+    });
+  }
 }
 function closeVlForm(){ document.getElementById("vlFormPanel").style.display = "none"; vlEditingId = null; }
 async function saveVlForm(){
@@ -5116,6 +5258,14 @@ function openClForm(id){
     const el = document.getElementById("cl_"+k);
     el.value = row && row[k] !== null && row[k] !== undefined ? row[k] : "";
   });
+  if(id){
+    refreshRecordIfCloudIsNewer("customer_ledger", id).then(refreshed=>{
+      if(refreshed && clEditingId === id){
+        openClForm(id);
+        showSyncToast("This record was edited elsewhere since you last saw it — refreshed with the latest version.", false);
+      }
+    });
+  }
 }
 function closeClForm(){ document.getElementById("clFormPanel").style.display = "none"; clEditingId = null; }
 async function saveClForm(){
@@ -5379,6 +5529,14 @@ function openCdrForm(id, prefillCdId){
     e.target.dataset.cdId = match ? match.id : "";
   };
   document.getElementById("cdrFormPanel").scrollIntoView({behavior:"smooth", block:"nearest"});
+  if(id){
+    refreshRecordIfCloudIsNewer("cdr_sales", id).then(refreshed=>{
+      if(refreshed && cdrState.editingId === id){
+        openCdrForm(id, null);
+        showSyncToast("This record was edited elsewhere since you last saw it — refreshed with the latest version.", false);
+      }
+    });
+  }
 }
 function closeCdrForm(){ document.getElementById("cdrFormPanel").style.display = "none"; cdrState.editingId = null; }
 async function saveCdrForm(){
@@ -6122,6 +6280,14 @@ function openVoucherForm(type, id){
   document.getElementById("d2dCancelBtn").addEventListener("click", closeVoucherForm);
   document.getElementById("d2dDeleteBtn").addEventListener("click", deleteVoucher);
   panel.scrollIntoView({behavior:"smooth", block:"nearest"});
+  if(id){
+    refreshRecordIfCloudIsNewer("transactions", id).then(refreshed=>{
+      if(refreshed && d2dState.editingId === id){
+        openVoucherForm(type, id);
+        showSyncToast("This entry was edited elsewhere since you last saw it — refreshed with the latest version.", false);
+      }
+    });
+  }
 }
 function closeVoucherForm(){
   document.getElementById("d2dFormPanel").style.display = "none";
